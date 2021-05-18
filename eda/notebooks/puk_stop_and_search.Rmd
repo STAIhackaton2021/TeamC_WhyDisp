@@ -1,0 +1,1288 @@
+---
+title: "Police UK Stop and Search Data"
+author: "Alex Jackson <alex.jackson@kcl.ac.uk>"
+output:
+  html_notebook:
+    toc: yes
+    number_sections: yes
+  html_document:
+    toc: yes
+    number_sections: yes
+    df_print: paged
+  pdf_document:
+    toc: yes
+---
+```{r setup, include=FALSE}
+# Packages
+require(knitr)
+require(tidyverse)
+require(ggforce)
+require(RcppRoll)
+
+# Configuration
+DATA_PATH = "../data/output/reference/puk_stop_and_search_extended.csv"
+METADATA_PATH = "../data/input/stop_and_search/meta/"
+
+# Functions
+identify_type <- function(x) {
+  if (is.factor(x)) return("factor")
+  else if (inherits(x, "POSIXlt")) return("datetime")
+  else return(typeof(x))
+}
+
+trim_text <- function(l, n = 65) {
+  full = paste0(l, collapse = ", ")
+  if (nchar(full) > n - 1) {
+    return(paste0(substr(full, 1, n - 3), "..."))
+  } else {
+    return(paste0(full, "."))
+  }
+}
+
+struct <- function(x) {
+  data.frame(
+    variable = names(x),
+    class = sapply(x, identify_type),
+    examples = sapply(x, function(y) 
+      ifelse(is.factor(y), trim_text(levels(y)), trim_text(head(y)))),
+    row.names = NULL)
+}
+
+# Read Police UK data
+data <- read.csv(DATA_PATH)
+
+# Format variables
+data$date <- as.POSIXlt(data$date, "UTC")
+data$type <- factor(data$type)
+data$gender <- factor(data$gender)
+data$age_range <- factor(data$age_range)
+data$ethnicity_self_rpt <- factor(data$ethnicity_self_rpt)
+data$ethnicity_officer_rpt <- factor(data$ethnicity_officer_rpt)
+data$legislation <- factor(data$legislation)
+data$search_object <- factor(data$search_object)
+data$outcome <- factor(data$outcome)
+
+# Higher-level self-reported ethnicity category
+data$ethnicity_self_rpt_cat <- sapply(
+  strsplit(as.character(data$ethnicity_self_rpt), " - "), function(v) v[1])
+data$ethnicity_self_rpt_cat <- factor(data$ethnicity_self_rpt_cat)
+
+# True/False positive result
+data$positive <- data$outcome != levels(data$outcome)[1]
+
+# Static data frames
+data_types <- data.frame(
+  variable = names(data),
+  type = c(
+    rep("search", 5), rep("demographic", 4), rep("search", 17), 
+    "demographic", "search"))
+
+# Original data frames (e.g. short names for legislation etc.)
+legislation_short_names <- read.csv(
+  paste0(METADATA_PATH, "legislation_short_names.csv"))
+object_short_names <- read.csv(
+  paste0(METADATA_PATH, "search_object_short_names.csv"))
+outcome_short_names <- read.csv(
+  paste0(METADATA_PATH, "outcome_short_names.csv"))
+```
+
+```{r plt_utils, include=FALSE}
+freq_plot <- function(plt, label_width = 80, legend.position = "right") {
+  plt + 
+    ggplot2::geom_bar(alpha = 0.4) +
+    ggplot2::scale_x_discrete(
+      labels = function(l) stringr::str_wrap(l, width = label_width)) + 
+    ggplot2::scale_y_continuous(labels = function(x) x / 1000) +
+    ggplot2::theme_minimal() +
+    ggplot2::theme(legend.position = legend.position)
+}
+
+stacked_bar_plot <- function(plt, label_width = 80, legend.position = "right") {
+  plt + 
+    ggplot2::geom_bar(position = "fill", alpha = 0.4) +
+    ggplot2::scale_x_discrete(
+      labels = function(l) stringr::str_wrap(l, width = label_width)) + 
+    ggplot2::scale_y_continuous(
+      labels = function(x) paste0(round(x * 100), "%")) +
+    ggplot2::theme_minimal() + 
+    ggplot2::theme(legend.position = legend.position)
+}
+```
+
+# Introduction
+This document contains some preliminary descriptive plots and frequency analysis for the Police UK Stop and Search datasets provided by MOPAC.
+Largely the data corresponds to the Metropolitan Stop and Search Dashboard data which is grouped by borough.
+The source dataset contains three `.csv` files that contain data for 2018, 2019, and 2020.
+The data presented here has been consolidated and reformatted for ease of use: shown below are the first few observations of four variables from the source data.
+
+```{r tbl_sample_data, echo=TRUE}
+head(data[, c("type", "gender", "age_range", "legislation")])
+```
+
+Each row of the table is an observation of a stop and search that was carried out during 2018-20.
+Two extraneous date variables and two unused variables were removed from the source data provided by MOPAC.
+The complete structure of the remaining data is given below alongside examples of the categories and values contained in the dataset.
+
+```{r tbl_data_structure, echo=FALSE}
+struct(data)
+```
+
+We can broadly group the variables into two categories: **search** and **demographic** data.
+
+```{r tbl_data_types, echo=FALSE}
+data_types[order(data_types$type, decreasing = TRUE), ]
+```
+
+Within the demographic variables, there are two different descriptions of each searched individual's ethnicity: `ethnicity_self_rpt` (which is self-reported) and `ethnicity_officer_rpt` (which is recorded by the searching officer).
+The officer-reported ethnicity has four possible values.
+
+```{r vec_officer_rpt_levels, echo=TRUE}
+levels(data$ethnicity_officer_rpt)
+```
+
+Self-reported ethnicity has a much wider range of possible responses that can be grouped into five higher-level categories.
+The source data contains the following unique values from which the category can be trivially extracted.
+Below are the possible values for both `ethnicity_self_rpt` and `ethnicity_self_rpt_cat`.
+
+```{r vec_ethnicity_self_rpt_levels, echo=TRUE}
+levels(data$ethnicity_self_rpt)
+```
+
+```{r vec_ethnicity_self_rpt_cat_levels, echo=TRUE}
+levels(data$ethnicity_self_rpt_cat)
+```
+
+The relationship between officer reported ethnicity and self reported ethnicity can be seen in the following figure.
+
+```{r plt_ethnicity_rpt_comparison, echo=FALSE}
+data %>%
+  dplyr::group_by(ethnicity_officer_rpt, ethnicity_self_rpt_cat) %>%
+  dplyr::summarise(count = dplyr::n(), .groups = "drop") %>%
+  na.omit() %>%
+  ggforce::gather_set_data(1:2) %>%
+  ggplot2::ggplot(aes(x, id = id, split = y, value = count)) +
+  ggforce::geom_parallel_sets(
+    ggplot2::aes(fill = ethnicity_officer_rpt), 
+    alpha = 0.4, 
+    axis.width = 0.05) +
+  ggforce::geom_parallel_sets_axes(axis.width = 0.05) +
+  ggforce::geom_parallel_sets_labels(
+    size = 3, 
+    angle = 0,
+    position = ggplot2::position_nudge(x = 0.04, y = 0),
+    hjust = 0) +
+  ggplot2::scale_y_continuous(labels = function(x) x / 1000) +
+  ggplot2::theme_minimal() +
+  ggplot2::theme(legend.position = "none") +
+  ggplot2::scale_x_discrete(
+    labels = c("Officer Reported", "Self Reported Category"),
+    expand = ggplot2::expansion(mult = c(.1, .4))) +
+  ggplot2::labs(
+    title = "Officer versus Self Reported Ethnicity Frequency",
+    caption = "Source: Police UK Stop and Search Data",
+    x = ggplot2::element_blank(),
+    y = "# of Searches (1000s)"
+  )
+```
+
+In the following, we will only make reference to self-reported ethnicity categories unless otherwise stated.
+
+# Aggregated Data
+In this section we will consider the aggregated data on stop and searches contained within the files provided by MOPAC.
+This contains data on stop and searches carried out between the following dates.
+
+```{r vec_date_range, echo=TRUE}
+c(min(data$date), max(data$date))
+```
+
+There are a total of `565,113` observations contained in the source data --- a summary of the number of observations for each of the demographics is given below.
+```{r tbl_summary, echo=TRUE}
+summary(data[, c("type", "gender", "age_range", "ethnicity_self_rpt_cat")])
+```
+
+## Search Data
+First, we will look at the frequencies and relationship between some of the search data variables described in the material provided by MOPAC.
+The variables classified, for the purposes of this document, as `search` are shown below.
+```{r vec_search_data_variables}
+data_types$variable[data_types$type == "search"]
+```
+
+### Frequency Plots
+The following plots are simple frequency bar charts that speak to the type, purpose, and outcome of stop and searches in London.
+
+#### Type of Search
+```{r plt_type, echo=FALSE}
+ggplot2::ggplot(data, ggplot2::aes(type, fill = type)) %>%
+  freq_plot(legend.position = "none") + 
+  ggplot2::labs(
+    x = "Search Type", 
+    y = "# of Searches (1000s)",
+    title = "Type of Search Frequency", 
+    caption = "Source: Police UK Stop and Search Data"
+  )
+```
+
+#### Legislation Used
+```{r plt_legislation, echo=FALSE}
+ggplot2::ggplot(data, ggplot2::aes(legislation, fill = legislation)) %>%
+  freq_plot(label_width = 20, legend.position = "none") + 
+  ggplot2::labs(
+    x = "Legislation", 
+    y = "# of Searches (1000s)", 
+    title = "Search Frequency by Legislation Used", 
+    caption = "Source: Police UK Stop and Search Data"
+  )
+```
+
+#### Object of Search
+```{r plt_search_object, echo=FALSE}
+ggplot2::ggplot(data, ggplot2::aes(search_object, fill = search_object)) %>%
+  freq_plot(label_width = 10, legend.position = "none") +
+  ggplot2::labs(
+    x = "Object of Search", 
+    y = "# of Searches (1000s)", 
+    title = "Object of Search Frequency", 
+    caption = "Source: Police UK Stop and Search Data"
+  )
+```
+
+#### Outcome of Search
+```{r plt_outcome, echo=FALSE}
+ggplot2::ggplot(data, ggplot2::aes(outcome, fill = outcome)) %>%
+  freq_plot(label_width = 15, legend.position = "none") + 
+  ggplot2::labs(
+    x = "Outcome of Search", 
+    y = "# of Searches (1000s)", 
+    title = "Outcome of Search Frequency", 
+    caption = "Source: Police UK Stop and Search Data"
+  )
+```
+
+### Relationship between Search Variables
+The following plot connects the object of a search with the outcome of a search.
+It is not known from this data whether the outcome was related to the original object of the search.
+```{r plt_search_object_to_outcome, echo=FALSE}
+data %>%
+  # Join short names to data and aggregate
+  dplyr::left_join(outcome_short_names, by = "outcome") %>%
+  dplyr::left_join(object_short_names, by = "search_object") %>%
+  dplyr::group_by(outcome_short, search_object_short) %>%
+  dplyr::summarise(count = dplyr::n(), .groups = "drop") %>%
+  na.omit() %>%
+  # Convert to parallel set data format
+  ggforce::gather_set_data(1:2) %>%
+  # Set factor ordering of x-axis variables
+  dplyr::mutate(
+    x = factor(x, levels = c("search_object_short", "outcome_short"))) %>%
+  # Plot figure
+  ggplot2::ggplot(aes(x, id = id, split = y, value = count)) +
+  ggforce::geom_parallel_sets(
+    ggplot2::aes(fill = search_object_short), 
+    alpha = 0.4, 
+    axis.width = 0.05) +
+  ggforce::geom_parallel_sets_axes(axis.width = 0.05) +
+  ggforce::geom_parallel_sets_labels(
+    size = 3, 
+    angle = 0,
+    position = ggplot2::position_nudge(x = 0.04, y = 0),
+    hjust = 0) +
+  ggplot2::scale_y_continuous(labels = function(x) x / 1000) +
+  ggplot2::scale_x_discrete(
+    labels = c("Object of Search", "Outcome"),
+    expand = ggplot2::expansion(mult = c(.1, .4))) +
+  ggplot2::theme_minimal() +
+  ggplot2::theme(legend.position = "none") +
+  ggplot2::labs(
+    title = "Object of Search versus Outcome Frequency",
+    caption = "Source: Police UK Stop and Search Data",
+    x = ggplot2::element_blank(),
+    y = "# of Searches (1000s)"
+  )
+```
+
+This plot connects the legislation used to authorise the search with the above data.
+```{r plt_search_legislation_object_to_outcome, echo=FALSE}
+data %>%
+  # Join short names to data and aggregate
+  dplyr::left_join(legislation_short_names, by = "legislation") %>%
+  dplyr::left_join(outcome_short_names, by = "outcome") %>%
+  dplyr::left_join(object_short_names, by = "search_object") %>%
+  dplyr::group_by(legislation_short, outcome_short, search_object_short) %>%
+  dplyr::summarise(count = dplyr::n(), .groups = "drop") %>%
+  na.omit() %>%
+  # Convert to parallel set data format
+  ggforce::gather_set_data(1:3) %>%
+  # Set factor ordering of x-axis variables
+  dplyr::mutate(x = factor(
+    x, levels = c(
+      "legislation_short", "search_object_short", "outcome_short"))) %>%
+  # Plot figure
+  ggplot2::ggplot(aes(x, id = id, split = y, value = count)) +
+  ggforce::geom_parallel_sets(
+    ggplot2::aes(fill = legislation_short), 
+    alpha = 0.4, 
+    axis.width = 0.05) +
+  ggforce::geom_parallel_sets_axes(axis.width = 0.05) +
+  ggforce::geom_parallel_sets_labels(
+    size = 3, 
+    angle = 0,
+    position = ggplot2::position_nudge(x = 0.04, y = 0),
+    hjust = 0) +
+  ggplot2::scale_y_continuous(labels = function(x) x / 1000) +
+  ggplot2::scale_x_discrete(
+    labels = c("Legislation Used", "Object of Search", "Outcome"),
+    expand = ggplot2::expansion(mult = c(.1, .4))) +
+  ggplot2::theme_minimal() +
+  ggplot2::theme(legend.position = "none") +
+  ggplot2::labs(
+    title = "Legislation Used, Object of Search and Outcome Frequency",
+    caption = "Source: Police UK Stop and Search Data",
+    x = ggplot2::element_blank(),
+    y = "# of Searches (1000s)"
+  )
+```
+
+Finally, we can also look at the connected data such that only *positive* searches are included.
+In this context, a *positive* search is one in which further action was taken.
+```{r plt_search_legislation_object_to_positive_outcome, echo=FALSE}
+data %>%
+  # Include only positive searches
+  dplyr::filter(positive) %>%
+  # Join short names to data and aggregate
+  dplyr::left_join(legislation_short_names, by = "legislation") %>%
+  dplyr::left_join(outcome_short_names, by = "outcome") %>%
+  dplyr::left_join(object_short_names, by = "search_object") %>%
+  dplyr::group_by(legislation_short, outcome_short, search_object_short) %>%
+  dplyr::summarise(count = dplyr::n(), .groups = "drop") %>%
+  na.omit() %>%
+  # Convert to parallel set data format
+  ggforce::gather_set_data(1:3) %>%
+  # Set factor ordering of x-axis variables
+  dplyr::mutate(x = factor(
+    x, levels = c(
+      "legislation_short", "search_object_short", "outcome_short"))) %>%
+  # Plot figure
+  ggplot2::ggplot(aes(x, id = id, split = y, value = count)) +
+  ggforce::geom_parallel_sets(
+    ggplot2::aes(fill = legislation_short), 
+    alpha = 0.4, 
+    axis.width = 0.05) +
+  ggforce::geom_parallel_sets_axes(axis.width = 0.05) +
+  ggforce::geom_parallel_sets_labels(
+    size = 3, 
+    angle = 0,
+    position = ggplot2::position_nudge(x = 0.04, y = 0),
+    hjust = 0) +
+  ggplot2::scale_y_continuous(labels = function(x) x / 1000) +
+  ggplot2::scale_x_discrete(
+    labels = c("Legislation Used", "Object of Search", "Outcome"),
+    expand = ggplot2::expansion(mult = c(.1, .4))) +
+  ggplot2::theme_minimal() +
+  ggplot2::theme(legend.position = "none") +
+  ggplot2::labs(
+    title = "Legislation Used, Object of Search and Outcome Frequency (Positive)",
+    subtitle = "Only positive searches (those resulting in further action) are included.",
+    caption = "Source: Police UK Stop and Search Data",
+    x = ggplot2::element_blank(),
+    y = "# of Positive Searches (1000s)"
+  )
+```
+
+## Demographic Data
+In this section, we will look at the relationship between the demographic variables and the search variables within the Police UK data.
+The variables classified, for the purposes of this document, as `demographic` are shown below.
+```{r vec_demographic_data_variables}
+data_types$variable[data_types$type == "demographic"]
+```
+
+As discussed above, we will only look at `ethnicity_self_rpt_cat` in this document (unless stated otherwise).
+
+### Frequency Plots
+The following plots attempt to show both the frequency of and relationship between searches and different demographic variables.
+Specifically, we compare rates of *positive* and *negative* searches; legislation usage; search objectives; and search outcomes for each demographic category.
+
+#### Total Searches by Demographic
+```{r plt_demographic_sankey, echo=FALSE}
+data %>%
+  # Don't include under 10s
+  dplyr::filter(age_range != levels(data$age_range)[5]) %>%
+  # Join short names to data and aggregate
+  dplyr::group_by(gender, age_range, ethnicity_self_rpt_cat) %>%
+  dplyr::summarise(count = dplyr::n(), .groups = "drop") %>%
+  na.omit() %>%
+  # Convert to parallel set data format
+  ggforce::gather_set_data(1:3) %>%
+  # Set factor ordering of x-axis variables
+  dplyr::mutate(x = factor(x, levels = c(
+    "age_range", "gender", "ethnicity_self_rpt_cat"))) %>%
+  # Plot figure
+  ggplot2::ggplot(aes(x, id = id, split = y, value = count)) +
+  ggforce::geom_parallel_sets(
+    ggplot2::aes(fill = age_range), 
+    alpha = 0.4, 
+    axis.width = 0.05) +
+  ggforce::geom_parallel_sets_axes(axis.width = 0.05) +
+  ggforce::geom_parallel_sets_labels(
+    size = 3, 
+    angle = 0,
+    position = ggplot2::position_nudge(x = 0.04, y = 0),
+    hjust = 0) +
+  ggplot2::scale_y_continuous(labels = function(x) x / 1000) +
+  ggplot2::scale_x_discrete(
+    labels = c("Age Range", "Gender", "Ethnicity"),
+    expand = ggplot2::expansion(mult = c(.1, .4))) +
+  ggplot2::theme_minimal() +
+  ggplot2::theme(legend.position = "none") +
+  ggplot2::labs(
+    title = "Age, Gender, and Ethnicity Search Frequencies",
+    subtitle = "Those recorded as under the age of 10 are excluded.",
+    caption = "Source: Police UK Stop and Search Data",
+    x = ggplot2::element_blank(),
+    y = "# of Searches (1000s)"
+  )
+```
+
+```{r plt_gender_positive, echo=FALSE}
+data %>%
+  ggplot2::ggplot(ggplot2::aes(gender, fill = positive)) %>%
+  freq_plot(legend.position = "bottom") +
+  ggplot2::scale_fill_discrete(labels = c("False Positive", "True Positive")) +
+  ggplot2::labs(
+    x = "Gender", 
+    y = "# of Searches (1000s)",
+    fill = "Search Result:",
+    title = "Gender and False/True Positive Frequency",
+    subtitle = "A true positive is a search that did not lead to no further action.",
+    caption = "Source: Police UK Stop and Search Data"
+  )
+```
+
+```{r plt_age_range_positive, echo=FALSE}
+data %>%
+  ggplot2::ggplot(ggplot2::aes(age_range, fill = positive)) %>%
+  freq_plot(legend.position = "bottom") +
+  ggplot2::scale_fill_discrete(labels = c("False Positive", "True Positive")) +
+  ggplot2::labs(
+    x = "Age Range", 
+    y = "# of Searches (1000s)",
+    fill = "Search Result:",
+    title = "Age Range and False/True Positive Frequency",
+    subtitle = "A true positive is a search that did not lead to no further action.",
+    caption = "Source: Police UK Stop and Search Data"
+  )
+```
+
+```{r plt_ethnicity_positive, echo=FALSE}
+data %>%
+  ggplot2::ggplot(ggplot2::aes(ethnicity_self_rpt_cat, fill = positive)) %>%
+  freq_plot(label_width = 20, legend.position = "bottom") +
+  ggplot2::scale_fill_discrete(labels = c("False Positive", "True Positive")) +
+  ggplot2::labs(
+    x = "Ethnicity (Self Reported)", 
+    y = "# of Searches (1000s)",
+    fill = "Search Result:",
+    title = "Ethnicity and False/True Positive Frequency",
+    subtitle = "A true positive is a search that did not lead to no further action.",
+    caption = "Source: Police UK Stop and Search Data"
+  )
+```
+
+### Gender and Search Variables
+```{r plt_gender_positive_percent, echo=FALSE}
+data %>%
+  ggplot2::ggplot(ggplot2::aes(gender, fill = positive)) %>%
+  stacked_bar_plot(legend.position = "bottom") +
+  ggplot2::scale_fill_discrete(labels = c("False Positive", "True Positive")) +
+  ggplot2::labs(
+    x = "Gender", 
+    y = "Percent of Searches",
+    fill = "Search Result:",
+    title = "Gender and False/True Positive Frequency (Percentage)",
+    subtitle = "A true positive is a search that did not lead to no further action.",
+    caption = "Source: Police UK Stop and Search Data"
+  )
+```
+
+```{r plt_gender_legislation_percent, echo=FALSE}
+data %>%
+  dplyr::left_join(legislation_short_names, by = "legislation") %>%
+  ggplot2::ggplot(ggplot2::aes(gender, fill = legislation_short)) %>%
+  stacked_bar_plot(label_width = 10) +
+  ggplot2::labs(
+    x = "Gender", 
+    y = "Percent of Searches",
+    fill = "Legislation",
+    title = "Gender and Legislation Frequency (Percentage)", 
+    caption = "Source: Police UK Stop and Search Data"
+  )
+```
+
+```{r plt_gender_object_percent, echo=FALSE}
+data %>%
+  dplyr::left_join(object_short_names, by = "search_object") %>%
+  ggplot2::ggplot(ggplot2::aes(gender, fill = search_object_short)) %>%
+  stacked_bar_plot(label_width = 10) +
+  ggplot2::labs(
+    x = "Gender", 
+    y = "Percent of Searches",
+    fill = "Search Object",
+    title = "Gender and Search Object Frequency (Percentage)", 
+    caption = "Source: Police UK Stop and Search Data"
+  )
+```
+
+```{r plt_gender_outcome_percent, echo=FALSE}
+data %>%
+  dplyr::left_join(outcome_short_names, by = "outcome") %>%
+  ggplot2::ggplot(ggplot2::aes(gender, fill = outcome_short)) %>%
+  stacked_bar_plot(label_width = 10) +
+  ggplot2::labs(
+    x = "Gender", 
+    y = "Percent of Searches",
+    fill = "Outcome",
+    title = "Gender and Outcome Frequency (Percentage)", 
+    caption = "Source: Police UK Stop and Search Data"
+  )
+```
+
+```{r plt_gender_outcome_percent_positive, echo=FALSE}
+  data %>%
+  dplyr::filter(positive) %>%
+  dplyr::left_join(outcome_short_names, by = "outcome") %>%
+  ggplot2::ggplot(ggplot2::aes(gender, fill = outcome_short)) %>%
+  stacked_bar_plot(label_width = 10) +
+  ggplot2::labs(
+    x = "Gender", 
+    y = "Percent of Positive Searches",
+    fill = "Outcome",
+    title = "Gender and Outcome Frequency (Percentage of True Positives)",
+    subtitle = "A true positive is a search that did not lead to no further action.",
+    caption = "Source: Police UK Stop and Search Data"
+  )
+```
+
+### Age Range and Search Variables
+```{r plt_age_range_positive_percent, echo=FALSE}
+data %>%
+  ggplot2::ggplot(ggplot2::aes(age_range, fill = positive)) %>%
+  stacked_bar_plot(legend.position = "bottom") +
+  ggplot2::scale_fill_discrete(labels = c("False Positive", "True Positive")) +
+  ggplot2::labs(
+    x = "Age Range", 
+    y = "Percent of Searches",
+    fill = "Search Result:",
+    title = "Age Range and False/True Positive Frequency (Percentage)",
+    subtitle = "A true positive is a search that did not lead to no further action.",
+    caption = "Source: Police UK Stop and Search Data"
+  )
+```
+
+```{r plt_age_range_legislation_percent, echo=FALSE}
+data %>%
+  dplyr::left_join(legislation_short_names, by = "legislation") %>%
+  ggplot2::ggplot(ggplot2::aes(age_range, fill = legislation_short)) %>%
+  stacked_bar_plot(label_width = 10) +
+  ggplot2::labs(
+    x = "Age Range", 
+    y = "Percent of Searches",
+    fill = "Legislation",
+    title = "Age Range and Legislation Frequency (Percentage)", 
+    caption = "Source: Police UK Stop and Search Data"
+  )
+```
+
+```{r plt_age_range_object_percent, echo=FALSE}
+data %>%
+  dplyr::left_join(object_short_names, by = "search_object") %>%
+  ggplot2::ggplot(ggplot2::aes(age_range, fill = search_object_short)) %>%
+  stacked_bar_plot(label_width = 10) +
+  ggplot2::labs(
+    x = "Age Range", 
+    y = "Percent of Searches",
+    fill = "Search Object",
+    title = "Age Range and Search Object Frequency (Percentage)", 
+    caption = "Source: Police UK Stop and Search Data"
+  )
+```
+
+```{r plt_age_range_outcome_percent, echo=FALSE}
+data %>%
+  dplyr::left_join(outcome_short_names, by = "outcome") %>%
+  ggplot2::ggplot(ggplot2::aes(age_range, fill = outcome_short)) %>%
+  stacked_bar_plot(label_width = 10) +
+  ggplot2::labs(
+    x = "Age Range", 
+    y = "Percent of Searches",
+    fill = "Outcome",
+    title = "Age Range and Outcome Frequency (Percentage)", 
+    caption = "Source: Police UK Stop and Search Data"
+  )
+```
+
+```{r plt_age_range_outcome_percent_positive, echo=FALSE}
+  data %>%
+  dplyr::filter(positive) %>%
+  dplyr::left_join(outcome_short_names, by = "outcome") %>%
+  ggplot2::ggplot(ggplot2::aes(age_range, fill = outcome_short)) %>%
+  stacked_bar_plot(label_width = 10) +
+  ggplot2::labs(
+    x = "Age Range", 
+    y = "Percent of Positive Searches",
+    fill = "Outcome",
+    title = "Age Range and Outcome Frequency (Percentage of True Positives)",
+    subtitle = "A true positive is a search that did not lead to no further action.",
+    caption = "Source: Police UK Stop and Search Data"
+  )
+```
+
+### Ethnicity and Search Variables
+```{r plt_ethnicity_positive_percent, echo=FALSE}
+data %>%
+  ggplot2::ggplot(ggplot2::aes(ethnicity_self_rpt_cat, fill = positive)) %>%
+  stacked_bar_plot(label_width = 20, legend.position = "bottom") +
+  ggplot2::scale_fill_discrete(labels = c("False Positive", "True Positive")) +
+  ggplot2::labs(
+    x = "Ethnicity (Self Reported)", 
+    y = "Percent of Searches",
+    fill = "Search Result:",
+    title = "Ethnicity and False/True Positive Frequency (Percentage)",
+    subtitle = "A true positive is a search that did not lead to no further action.",
+    caption = "Source: Police UK Stop and Search Data"
+  )
+```
+
+```{r plt_ethnicity_legislation_percent, echo=FALSE}
+data %>%
+  dplyr::left_join(legislation_short_names, by = "legislation") %>%
+  ggplot2::ggplot(ggplot2::aes(ethnicity_self_rpt_cat, fill = legislation_short)) %>%
+  stacked_bar_plot(label_width = 10) +
+  ggplot2::labs(
+    x = "Ethnicity (Self Reported)", 
+    y = "Percent of Searches",
+    fill = "Legislation",
+    title = "Ethnicity and Legislation Frequency (Percentage)", 
+    caption = "Source: Police UK Stop and Search Data"
+  )
+```
+
+```{r plt_ethnicity_object_percent, echo=FALSE}
+data %>%
+  dplyr::left_join(object_short_names, by = "search_object") %>%
+  ggplot2::ggplot(ggplot2::aes(ethnicity_self_rpt_cat, fill = search_object_short)) %>%
+  stacked_bar_plot(label_width = 10) +
+  ggplot2::labs(
+    x = "Ethnicity (Self Reported)", 
+    y = "Percent of Searches",
+    fill = "Search Object",
+    title = "Ethnicity and Search Object Frequency (Percentage)", 
+    caption = "Source: Police UK Stop and Search Data"
+  )
+```
+
+```{r plt_ethnicity_outcome_percent, echo=FALSE}
+data %>%
+  dplyr::left_join(outcome_short_names, by = "outcome") %>%
+  ggplot2::ggplot(ggplot2::aes(ethnicity_self_rpt_cat, fill = outcome_short)) %>%
+  stacked_bar_plot(label_width = 10) +
+  ggplot2::labs(
+    x = "Ethnicity (Self Reported)", 
+    y = "Percent of Searches",
+    fill = "Outcome",
+    title = "Ethnicity and Outcome Frequency (Percentage)", 
+    caption = "Source: Police UK Stop and Search Data"
+  )
+```
+
+```{r plt_ethnicity_outcome_percent_positive, echo=FALSE}
+  data %>%
+  dplyr::filter(positive) %>%
+  dplyr::left_join(outcome_short_names, by = "outcome") %>%
+  ggplot2::ggplot(ggplot2::aes(ethnicity_self_rpt_cat, fill = outcome_short)) %>%
+  stacked_bar_plot(label_width = 10) +
+  ggplot2::labs(
+    x = "Ethnicity (Self Reported)", 
+    y = "Percent of Positive Searches",
+    fill = "Outcome",
+    title = "Ethnicity and Outcome Frequency (Percentage of True Positives)",
+    subtitle = "A true positive is a search that did not lead to no further action.",
+    caption = "Source: Police UK Stop and Search Data"
+  )
+```
+
+## Additional Plots
+### Ethnicity, Object of Search, and Outcome
+```{r plt_ethnicity_sankey, echo=FALSE}
+data %>%
+  # Join short names to data and aggregate
+  dplyr::left_join(outcome_short_names, by = "outcome") %>%
+  dplyr::left_join(object_short_names, by = "search_object") %>%
+  dplyr::group_by(
+    ethnicity_self_rpt_cat, 
+    outcome_short, 
+    search_object_short) %>%
+  dplyr::summarise(count = dplyr::n(), .groups = "drop") %>%
+  na.omit() %>%
+  # Convert to parallel set data format
+  ggforce::gather_set_data(1:3) %>%
+  # Set factor ordering of x-axis variables
+  dplyr::mutate(x = factor(x, levels = c(
+    "ethnicity_self_rpt_cat",
+    "search_object_short",
+    "outcome_short"))) %>%
+  # Plot figure
+  ggplot2::ggplot(aes(x, id = id, split = y, value = count)) +
+  ggforce::geom_parallel_sets(
+    ggplot2::aes(fill = outcome_short), 
+    alpha = 0.4, 
+    axis.width = 0.05) +
+  ggforce::geom_parallel_sets_axes(axis.width = 0.05) +
+  ggforce::geom_parallel_sets_labels(
+    size = 3, 
+    angle = 0,
+    position = ggplot2::position_nudge(x = 0.04, y = 0),
+    hjust = 0) +
+  ggplot2::scale_y_continuous(labels = function(x) x / 1000) +
+  ggplot2::scale_x_discrete(
+    labels = c("Ethnicity", "Object of Search", "Outcome"),
+    expand = ggplot2::expansion(mult = c(.1, .4))) +
+  ggplot2::theme_minimal() +
+  ggplot2::theme(legend.position = "none") +
+  ggplot2::labs(
+    title = "Ethnicity, Object and Outcome Frequency",
+    caption = "Source: Police UK Stop and Search Data",
+    x = ggplot2::element_blank(),
+    y = "# of Searches (1000s)"
+  )
+```
+
+```{r plt_ethnicity_sankey_positive, echo=FALSE}
+data %>%
+  dplyr::filter(positive) %>%
+  # Join short names to data and aggregate
+  dplyr::left_join(outcome_short_names, by = "outcome") %>%
+  dplyr::left_join(object_short_names, by = "search_object") %>%
+  dplyr::group_by(
+    ethnicity_self_rpt_cat, 
+    outcome_short, 
+    search_object_short) %>%
+  dplyr::summarise(count = dplyr::n(), .groups = "drop") %>%
+  na.omit() %>%
+  # Convert to parallel set data format
+  ggforce::gather_set_data(1:3) %>%
+  # Set factor ordering of x-axis variables
+  dplyr::mutate(x = factor(x, levels = c(
+    "ethnicity_self_rpt_cat",
+    "search_object_short",
+    "outcome_short"))) %>%
+  # Plot figure
+  ggplot2::ggplot(aes(x, id = id, split = y, value = count)) +
+  ggforce::geom_parallel_sets(
+    ggplot2::aes(fill = outcome_short), 
+    alpha = 0.4, 
+    axis.width = 0.05) +
+  ggforce::geom_parallel_sets_axes(axis.width = 0.05) +
+  ggforce::geom_parallel_sets_labels(
+    size = 3, 
+    angle = 0,
+    position = ggplot2::position_nudge(x = 0.04, y = 0),
+    hjust = 0) +
+  ggplot2::scale_y_continuous(labels = function(x) x / 1000) +
+  ggplot2::scale_x_discrete(
+    labels = c("Ethnicity", "Object of Search", "Outcome"),
+    expand = ggplot2::expansion(mult = c(.1, .4))) +
+  ggplot2::theme_minimal() +
+  ggplot2::theme(legend.position = "none") +
+  ggplot2::labs(
+    title = "Ethnicity, Object and Outcome Frequency (Positive)",
+    subtitle = "Only positive searches (those resulting in further action) are included.",
+    caption = "Source: Police UK Stop and Search Data",
+    x = ggplot2::element_blank(),
+    y = "# of Positive Searches (1000s)"
+  )
+```
+
+# Time Series Data
+```{r utils_time_series, include=FALSE}
+date_components <- function(d) {
+  d %>% dplyr::mutate(
+    short_date = as.Date(date),
+    year = lubridate::year(date),
+    month = lubridate::month(date),
+    day = lubridate::day(date),
+    hour = lubridate::hour(date),
+    minute = lubridate::minute(date))
+}
+
+calendar_plot <- function(
+  d, 
+  title = "Calendar", 
+  subtitle = NA, 
+  fill_label = "value") {
+  d %>%
+    ggplot2::ggplot(ggplot2::aes(weekday,-week, fill = count)) +
+    ggplot2::geom_tile(colour = "white")  + 
+    ggplot2::geom_text(
+      ggplot2::aes(label = lubridate::day(short_date)), 
+      size = 2.5, 
+      color = "black") +
+    ggplot2::theme(
+      aspect.ratio = 1/2,
+      legend.position = "top",
+      legend.key.width = ggplot2::unit(3, "cm"),
+      axis.title.x = ggplot2::element_blank(),
+      axis.title.y = ggplot2::element_blank(),
+      axis.text.y = ggplot2::element_blank(),
+      panel.grid = ggplot2::element_blank(),
+      axis.ticks = ggplot2::element_blank(),
+      panel.background = ggplot2::element_blank(),
+      legend.title.align = 0.5,
+      strip.background = ggplot2::element_blank(),
+      strip.text = ggplot2::element_text(face = "bold", size = 15),
+      panel.border = ggplot2::element_rect(colour = "grey", fill = NA, size = 1),
+      plot.title = ggplot2::element_text(
+        hjust = 0.5,
+        size = 21,
+        face = "bold",
+        margin = margin(0,0,0.5,0, unit = "cm"))) +
+      ggplot2::scale_fill_gradient(
+       low = "white",
+       high = "#f8766d",
+       name = fill_label,
+       guide = ggplot2::guide_colorbar(
+         title.position = "top", direction = "horizontal")) +
+    ggplot2::facet_wrap(~month, nrow = 4, ncol = 3, scales = "free") +
+    ggplot2::labs(
+      title = title, 
+      subtitle = ifelse(is.na(subtitle), "", subtitle))
+}
+```
+
+## Search Volume Trends
+### Total Searches Trend
+```{r plt_searches, echo=FALSE}
+data %>%
+  date_components() %>%
+  dplyr::group_by(short_date) %>%
+  dplyr::summarise(count = n()) %>%
+  ggplot2::ggplot(ggplot2::aes(short_date, count)) +
+  ggplot2::geom_smooth() +
+  ggplot2::geom_line() +
+  ggplot2::theme_minimal() +
+  ggplot2::labs(
+    title = "Stop and Search Volume",
+    x = "Date",
+    y = "Searches",
+    caption = "Source: Police UK Stop and Search Data"
+  )
+```
+
+```{r plt_roll_avg_14_day, echo=FALSE}
+data %>%
+  date_components() %>%
+  dplyr::group_by(short_date) %>%
+  dplyr::summarise(count = n()) %>%
+  dplyr::mutate(
+    roll_avg = RcppRoll::roll_mean(
+      count, n = 14, align = "right", fill = NA)) %>%
+  na.omit() %>%
+  ggplot2::ggplot(ggplot2::aes(short_date, roll_avg)) +
+  ggplot2::geom_smooth() +
+  ggplot2::geom_line() +
+  ggplot2::theme_minimal() +
+  ggplot2::labs(
+    title = "Stop and Search Volume (14 Day Rolling Average)",
+    x = "Date",
+    y = "Searches Per Day",
+    caption = "Source: Police UK Stop and Search Data"
+  )
+```
+
+```{r plt_roll_avg_3_month, echo=FALSE}
+data %>%
+  date_components() %>%
+  dplyr::group_by(short_date) %>%
+  dplyr::summarise(count = n()) %>%
+  dplyr::mutate(
+    roll_avg = RcppRoll::roll_mean(
+      count, n = 91, align = "right", fill = NA)) %>%
+  na.omit() %>%
+  ggplot2::ggplot(ggplot2::aes(short_date, roll_avg)) +
+  ggplot2::geom_smooth() +
+  ggplot2::geom_line() +
+  ggplot2::theme_minimal() +
+  ggplot2::labs(
+    title = "Stop and Search Volume (3 Month Rolling Average)",
+    x = "Date",
+    y = "Searches Per Day",
+    caption = "Source: Police UK Stop and Search Data"
+  )
+```
+
+### Time of Day Trend
+```{r plt_time_of_day, echo=FALSE}
+data %>%
+  dplyr::mutate(
+    hour = lubridate::hour(date),
+    minute = lubridate::minute(date),
+    fake_date = lubridate::ymd_hm(paste0("2000-01-01 ", hour, ":", minute))) %>%
+  dplyr::group_by(fake_date) %>%
+  dplyr::summarise(count = n() / length(unique(as.Date(date)))) %>%
+  ggplot2::ggplot(ggplot2::aes(x = fake_date, y = count)) +
+  ggplot2::geom_line() +
+  ggplot2::geom_smooth() +
+  ggplot2::theme_minimal() +
+  ggplot2::labs(
+    title = "Searches by Time of Day",
+    x = "Time of Day",
+    y = "Mean # of Searches Per Minute",
+    caption = "Source: Police UK Stop and Search Data"
+  )
+```
+
+```{r plt_time_of_day_roll_avg, echo=FALSE}
+data %>%
+  dplyr::mutate(
+    hour = lubridate::hour(date),
+    minute = lubridate::minute(date),
+    fake_date = lubridate::ymd_hm(paste0("2000-01-01 ", hour, ":", minute))) %>%
+  dplyr::group_by(fake_date) %>%
+  dplyr::summarise(count = n() / length(unique(as.Date(date)))) %>%
+  dplyr::mutate(
+    roll_avg = RcppRoll::roll_mean(
+      count, n = 60, align = "right", fill = NA)) %>%
+  na.omit() %>%
+  ggplot2::ggplot(ggplot2::aes(x = fake_date, y = roll_avg)) +
+  ggplot2::geom_line() +
+  ggplot2::geom_smooth() +
+  ggplot2::theme_minimal() +
+  ggplot2::labs(
+    title = "Searches by Time of Day (1 Hour Rolling Average)",
+    x = "Time of Day",
+    y = "Mean # of Searches Per Minute",
+    caption = "Source: Police UK Stop and Search Data"
+  )
+```
+
+### Calendar Heatmaps
+#### Total Searches
+```{r plt_heatmap_2018, echo=FALSE, fig.height=8, fig.width=6}
+data %>%
+  # Mutate data into format suitable for calendar plot
+  dplyr::mutate(short_date = as.Date(date)) %>%
+  dplyr::group_by(short_date) %>%
+  dplyr::summarise(count = n()) %>%
+  dplyr::mutate(
+    weekday = lubridate::wday(short_date, label = T),
+    month = lubridate::month(short_date, label = T),
+    date = lubridate::day(short_date),
+    week = lubridate::epiweek(short_date),
+    year = lubridate::year(short_date)) %>%
+  # Filter based on calendar year (exclude those in first week of next year)
+  dplyr::filter(year == 2018) %>%
+  dplyr::filter(month != "Dec" | week != 1) %>%
+  calendar_plot(title = "Stop and Search Heatmap 2018", fill_label = "Searches")
+```
+
+```{r plt_heatmap_2019, echo=FALSE, fig.height=8, fig.width=6}
+data %>%
+  # Mutate data into format suitable for calendar plot
+  dplyr::mutate(short_date = as.Date(date)) %>%
+  dplyr::group_by(short_date) %>%
+  dplyr::summarise(count = n()) %>%
+  dplyr::mutate(
+    weekday = lubridate::wday(short_date, label = T),
+    month = lubridate::month(short_date, label = T),
+    date = lubridate::day(short_date),
+    week = lubridate::epiweek(short_date),
+    year = lubridate::year(short_date)) %>%
+  # Filter based on calendar year (exclude those in first week of next year)
+  dplyr::filter(year == 2019) %>%
+  dplyr::filter(month != "Dec" | week != 1) %>%
+  calendar_plot(title = "Stop and Search Heatmap 2019", fill_label = "Searches")
+```
+
+#### Searches Excluding Notting Hill and Halloween
+```{r plt_heatmap_excl_nh_2018, echo=FALSE, fig.height=8, fig.width=6}
+data %>%
+  # Mutate data into format suitable for calendar plot
+  dplyr::mutate(short_date = as.Date(date)) %>%
+  dplyr::group_by(short_date) %>%
+  dplyr::summarise(orig_count = n()) %>%
+  dplyr::mutate(
+    weekday = lubridate::wday(short_date, label = T),
+    month = lubridate::month(short_date, label = T),
+    date = lubridate::day(short_date),
+    week = lubridate::epiweek(short_date),
+    year = lubridate::year(short_date)) %>%
+  # Filter based on calendar year (exclude those in first week of next year)
+  dplyr::filter(year == 2018) %>%
+  dplyr::filter(month != "Dec" | week != 1) %>%
+  dplyr::mutate(exclude = month == "Aug" & date %in% c(26, 27)) %>%
+  dplyr::mutate(exclude = exclude | month == "Oct" & date == 31) %>%
+  dplyr::mutate(count = ifelse(exclude, NA, orig_count)) %>%
+  calendar_plot(
+    title = "Stop and Search Heatmap 2018",
+    subtitle = "Searches during Notting Hill Carnival and Halloween have been excluded.",
+    fill_label = "Searches")
+```
+```{r plt_heatmap_excl_nh_2019, echo=FALSE, fig.height=8, fig.width=6}
+data %>%
+  # Mutate data into format suitable for calendar plot
+  dplyr::mutate(short_date = as.Date(date)) %>%
+  dplyr::group_by(short_date) %>%
+  dplyr::summarise(orig_count = n()) %>%
+  dplyr::mutate(
+    weekday = lubridate::wday(short_date, label = T),
+    month = lubridate::month(short_date, label = T),
+    date = lubridate::day(short_date),
+    week = lubridate::epiweek(short_date),
+    year = lubridate::year(short_date)) %>%
+  # Filter based on calendar year (exclude those in first week of next year)
+  dplyr::filter(year == 2019) %>%
+  dplyr::filter(month != "Dec" | week != 1) %>%
+  dplyr::mutate(exclude = month == "Aug" & date %in% c(25, 26)) %>%
+  dplyr::mutate(exclude = exclude | month == "Oct" & date == 31) %>%
+  dplyr::mutate(count = ifelse(exclude, NA, orig_count)) %>%
+  calendar_plot(
+    title = "Stop and Search Heatmap 2019",
+    subtitle = "Searches during Notting Hill Carnival and Halloween have been excluded.",
+    fill_label = "Searches")
+```
+
+## Demographic and Search Volume Trends
+### Gender and Search Volume
+```{r plt_gender_trend, echo=FALSE}
+data %>%
+  dplyr::mutate(short_date = as.Date(date)) %>%
+  dplyr::group_by(gender, short_date) %>%
+  dplyr::summarise(count = n(), .groups = "drop_last") %>%
+  dplyr::mutate(
+    count_avg = RcppRoll::roll_mean(
+      count, n = 91, align = "right", fill = NA)) %>%
+  dplyr::filter(!is.na(count_avg)) %>%
+  ggplot2::ggplot(ggplot2::aes(short_date, count_avg, fill = gender)) +
+  ggplot2::geom_area(alpha = 0.4) +
+  ggplot2::theme_minimal() +
+  ggplot2::labs(
+    title = "Gender and Search Trend (3 Month Rolling Average)",
+    x = "Time",
+    y = "# of Searches Per Day",
+    fill = "Gender")
+```
+
+```{r plt_gender_trend_percent, echo=FALSE}
+data %>%
+  dplyr::mutate(short_date = as.Date(date)) %>%
+  dplyr::group_by(gender, short_date) %>%
+  dplyr::summarise(count = n(), .groups = "drop_last") %>%
+  dplyr::mutate(
+    count_avg = RcppRoll::roll_mean(
+      count, n = 91, align = "right", fill = NA)) %>%
+  dplyr::filter(!is.na(count_avg)) %>%
+  ggplot2::ggplot(ggplot2::aes(short_date, count_avg, fill = gender)) +
+  ggplot2::geom_area(alpha = 0.4, position = "fill") +
+  ggplot2::scale_y_continuous(labels = function(p) paste0(round(p * 100), "%")) +
+  ggplot2::theme_minimal() +
+  ggplot2::labs(
+    title = "Gender and Search Trend (3 Month Rolling Average)",
+    x = "Time",
+    y = "Percent of Searches",
+    fill = "Gender")
+```
+
+### Age Range and Search Volume
+```{r plt_age_range_trend, echo=FALSE}
+data %>%
+  dplyr::mutate(short_date = as.Date(date)) %>%
+  dplyr::group_by(age_range, short_date) %>%
+  dplyr::summarise(count = n(), .groups = "drop_last") %>%
+  dplyr::mutate(
+    count_avg = RcppRoll::roll_mean(
+      count, n = 91, align = "right", fill = NA)) %>%
+  dplyr::filter(!is.na(count_avg) & !is.na(age_range)) %>%
+  ggplot2::ggplot(ggplot2::aes(short_date, count_avg, fill = age_range)) +
+  ggplot2::geom_area(alpha = 0.4) +
+  ggplot2::theme_minimal() +
+  ggplot2::labs(
+    title = "Age Range and Search Trend (3 Month Rolling Average)",
+    x = "Time",
+    y = "# of Searches Per Day",
+    fill = "Age Range")
+```
+
+```{r plt_age_range_trend_percent, echo=FALSE}
+data %>%
+  dplyr::mutate(short_date = as.Date(date)) %>%
+  dplyr::group_by(age_range, short_date) %>%
+  dplyr::summarise(count = n(), .groups = "drop_last") %>%
+  dplyr::mutate(
+    count_avg = RcppRoll::roll_mean(
+      count, n = 91, align = "right", fill = NA)) %>%
+  dplyr::filter(!is.na(count_avg) & !is.na(age_range)) %>%
+  ggplot2::ggplot(ggplot2::aes(short_date, count_avg, fill = age_range)) +
+  ggplot2::geom_area(alpha = 0.4, position = "fill") +
+  ggplot2::scale_y_continuous(labels = function(p) paste0(round(p * 100), "%")) +
+  ggplot2::theme_minimal() +
+  ggplot2::labs(
+    title = "Age Range and Search Trend (3 Month Rolling Average)",
+    x = "Time",
+    y = "Percent of Searches",
+    fill = "Age Range")
+```
+
+### Ethnicity and Search Volume
+```{r plt_ethnicity_trend, echo=FALSE}
+data %>%
+  dplyr::mutate(short_date = as.Date(date)) %>%
+  dplyr::group_by(ethnicity_self_rpt_cat, short_date) %>%
+  dplyr::summarise(count = n(), .groups = "drop_last") %>%
+  dplyr::mutate(
+    count_avg = RcppRoll::roll_mean(
+      count, n = 91, align = "right", fill = NA)) %>%
+  dplyr::filter(!is.na(count_avg)) %>%
+  ggplot2::ggplot(
+    ggplot2::aes(short_date, count_avg, fill = ethnicity_self_rpt_cat)) +
+  ggplot2::geom_area(alpha = 0.4) +
+  ggplot2::theme_minimal() +
+  ggplot2::labs(
+    title = "Ethnicity and Search Trend (3 Month Rolling Average)",
+    x = "Time",
+    y = "# of Searches Per Day",
+    fill = "Ethnicity (Self Reported)")
+```
+
+```{r plt_ethnicity_trend_percent, echo=FALSE}
+data %>%
+  dplyr::mutate(short_date = as.Date(date)) %>%
+  dplyr::group_by(ethnicity_self_rpt_cat, short_date) %>%
+  dplyr::summarise(count = n(), .groups = "drop_last") %>%
+  dplyr::mutate(
+    count_avg = RcppRoll::roll_mean(
+      count, n = 91, align = "right", fill = NA)) %>%
+  dplyr::filter(!is.na(count_avg)) %>%
+  ggplot2::ggplot(
+    ggplot2::aes(short_date, count_avg, fill = ethnicity_self_rpt_cat)) +
+  ggplot2::geom_area(alpha = 0.4, position = "fill") +
+  ggplot2::scale_y_continuous(labels = function(p) paste0(round(p * 100), "%")) +
+  ggplot2::theme_minimal() +
+  ggplot2::labs(
+    title = "Ethnicity and Search Trend (3 Month Rolling Average)",
+    x = "Time",
+    y = "Percent of Searches",
+    fill = "Ethnicity (Self Reported)")
+```
+
+# Location-based Data
+```{r read_shp_files, include=FALSE}
+SPATIAL_DIR = "../data/source/gla_spatial/"
+ESRI_DIR = paste0(SPATIAL_DIR, "statistical-gis-boundaries-london/ESRI/")
+BOROUGH_SHP_FILE = paste0(ESRI_DIR, "London_Borough_Excluding_MHW.shp")
+WARD_SHP_FILE = paste0(ESRI_DIR, "London_Ward_CityMerged.shp")
+MSOA_SHP_FILE = paste0(ESRI_DIR, "MSOA_2011_London_gen_MHW.shp")
+LSOA_SHP_FILE = paste0(ESRI_DIR, "LSOA_2011_London_gen_MHW.shp")
+OA_SHP_FILE = paste0(ESRI_DIR, "OA_2011_London_gen_MHW.shp")
+
+LOAC_SHP_FILE = paste0("../data/source/cis_spatial/ESRI Arc/LOAC.shp")
+
+shp_borough <- sf::st_read(BOROUGH_SHP_FILE) %>% sf::st_transform(4326)
+shp_ward <- sf::st_read(WARD_SHP_FILE) %>% sf::st_transform(4326)
+shp_msoa <- sf::st_read(MSOA_SHP_FILE) %>% sf::st_transform(4326)
+shp_lsoa <- sf::st_read(LSOA_SHP_FILE) %>% sf::st_transform(4326)
+shp_loac <- sf::st_read(LOAC_SHP_FILE) %>% sf::st_transform(4326)
+shp_oa <- sf::st_read(OA_SHP_FILE) %>% sf::st_transform(4326)
+```
+## Borough Map
+```{r borough_map, echo=FALSE}
+shp_borough %>% 
+  dplyr::left_join(
+    data %>% 
+      dplyr::group_by(lad_11_code) %>% 
+      dplyr::summarise(borough_count = dplyr::n()),
+    by = c(GSS_CODE = "lad_11_code")) %>%
+  ggplot2::ggplot() +
+  ggplot2::geom_sf() +
+  ggplot2::geom_sf(ggplot2::aes(fill = borough_count)) +
+  ggplot2::theme_void() +
+  ggplot2::labs(
+    title = "Stop and Search Volume by Borough",
+    fill = "Searches",
+    caption = "Source: Police UK Stop and Search Data, GLA Boundary Data"
+  )
+```
+
+## Ward Map
+```{r ward_map, echo=FALSE}
+shp_ward %>% 
+  dplyr::left_join(
+    data %>% 
+      dplyr::group_by(ward_11_code) %>% 
+      dplyr::summarise(ward_count = dplyr::n()),
+    by = c(GSS_CODE = "ward_11_code")) %>%
+  ggplot2::ggplot() +
+  ggplot2::geom_sf() +
+  ggplot2::geom_sf(ggplot2::aes(fill = ward_count), lwd = 0.4) +
+  ggplot2::theme_void() +
+  ggplot2::labs(
+    title = "Stop and Search Volume by Ward",
+    fill = "Searches",
+    caption = "Source: Police UK Stop and Search Data, GLA Boundary Data"
+  )
+```
+
+## Middle Super Output Area (MSOA) Map
+```{r msoa_map, echo=FALSE}
+shp_msoa %>% 
+  dplyr::left_join(
+    data %>% 
+      dplyr::group_by(msoa_11_code) %>% 
+      dplyr::summarise(msoa_count = dplyr::n()),
+    by = c(MSOA11CD = "msoa_11_code")) %>%
+  ggplot2::ggplot() +
+  ggplot2::geom_sf() +
+  ggplot2::geom_sf(ggplot2::aes(fill = msoa_count), lwd = 0.1) +
+  ggplot2::theme_void() +
+  ggplot2::labs(
+    title = "Stop and Search Volume by Middle Super Output Area (MSOA)",
+    fill = "Searches",
+    caption = "Source: Police UK Stop and Search Data, GLA Boundary Data"
+  )
+```
+
+## Lower Super Output Area (LSOA) Map
+```{r lsoa_map, echo=FALSE}
+shp_lsoa %>% 
+  dplyr::left_join(
+    data %>% 
+      dplyr::group_by(lsoa_11_code) %>% 
+      dplyr::summarise(lsoa_count = dplyr::n()),
+    by = c(LSOA11CD = "lsoa_11_code")) %>%
+  ggplot2::ggplot() +
+  ggplot2::geom_sf() +
+  ggplot2::geom_sf(ggplot2::aes(fill = lsoa_count), lwd = 0.1) +
+  ggplot2::theme_void() +
+  ggplot2::labs(
+    title = "Stop and Search Volume by Lower Super Output Area (LSOA)",
+    fill = "Searches",
+    caption = "Source: Police UK Stop and Search Data, GLA Boundary Data"
+  )
+
+```
+
+## Output Area (OA) Map
+```{r oa_map, echo=FALSE}
+shp_oa %>% 
+  dplyr::left_join(
+    data %>% 
+      dplyr::group_by(oa_11_code) %>% 
+      dplyr::summarise(oa_count = dplyr::n()),
+    by = c(OA11CD = "oa_11_code")) %>%  ggplot2::ggplot() +
+  ggplot2::geom_sf() +
+  ggplot2::geom_sf(ggplot2::aes(fill = oa_count), lwd = 0) +
+  ggplot2::theme_void() +
+  ggplot2::labs(
+    title = "Stop and Search Volume by Output Area",
+    fill = "Searches",
+    caption = "Source: Police UK Stop and Search Data, GLA Boundary Data"
+  )
+```
+
